@@ -1,8 +1,13 @@
-"""Theory class: fixed architecture + parameter PDFs; exposes correlator methods."""
+"""Theory class (JAX): fixed architecture + parameter PDFs.
+
+Field: phi(x) = c_N * sum_{j=1..N} varphi(x; theta_j),
+       c_N set by `normalization`.
+"""
 
 from math import factorial
 
-import numpy as np
+import jax
+import jax.numpy as jnp
 
 from .samplers import IIDSampler
 
@@ -17,9 +22,7 @@ def _set_partitions(n):
         return
     for rest in _set_partitions(n - 1):
         shifted = [frozenset(x + 1 for x in b) for b in rest]
-        # element 0 in its own block
         yield [frozenset({0})] + shifted
-        # element 0 joins an existing block
         for i in range(len(shifted)):
             new = list(shifted)
             new[i] = new[i] | {0}
@@ -27,32 +30,22 @@ def _set_partitions(n):
 
 
 class Theory:
-    """A fixed NN-FT theory: architecture + N + parameter distributions.
-
-    Field: phi(x) = c_N * sum_{j=1..N} varphi(x; theta_j)
-    where c_N is set by `normalization`.
-    """
-
     _NORMALIZATIONS = {
-        "1/sqrt(N)": lambda N: 1.0 / np.sqrt(N),
-        "1/N": lambda N: 1.0 / N,
+        "1/sqrt(N)": lambda N: 1.0 / jnp.sqrt(float(N)),
+        "1/N": lambda N: 1.0 / float(N),
         "none": lambda N: 1.0,
     }
 
     def __init__(self, architecture, N, param_dists, normalization="1/sqrt(N)"):
         """
         Args:
-            architecture: Architecture instance defining the single-neuron
-                          map varphi(x; theta_j). Determines which parameters
-                          each neuron has and their per-neuron shapes.
-            N:            int, number of neurons in the last (output) layer.
-            param_dists:  dict mapping each parameter name (as declared in
+            architecture: Architecture instance defining varphi(x; theta_j).
+            N:            int, number of neurons in the last layer.
+            param_dists:  dict mapping each parameter name (matching
                           `architecture.param_spec`) to a Distribution
-                          giving its per-neuron PDF. Keys must match the
-                          architecture's param_spec exactly.
-            normalization: prefactor c_N in phi(x) = c_N * sum_j varphi(x;theta_j).
-                          One of "1/sqrt(N)" (NNGP / standard NN init),
-                          "1/N" (mean-field), or "none" (raw sum).
+                          giving its per-neuron PDF in the i.i.d. baseline.
+            normalization: prefactor c_N in phi = c_N * sum_j varphi.
+                          One of "1/sqrt(N)", "1/N", "none".
         """
         spec = architecture.param_spec
         missing = set(spec) - set(param_dists)
@@ -72,7 +65,6 @@ class Theory:
         self._normalization = normalization
         self._c_N = self._NORMALIZATIONS[normalization](self._N)
 
-    # frozen attributes ---------------------------------------------------
     @property
     def architecture(self):
         return self._architecture
@@ -89,63 +81,82 @@ class Theory:
     def normalization(self):
         return self._normalization
 
-    # core ----------------------------------------------------------------
+    # ---- core ----
     def evaluate(self, x_points, params):
-        """phi at x_points (shape (n_pts, d_in)) for given params dict."""
-        x = np.atleast_2d(np.asarray(x_points, dtype=float))
+        """phi at x_points (shape (n_pts, d_in)) for one params dict."""
+        x = jnp.atleast_2d(jnp.asarray(x_points, dtype=jnp.float32))
         per_neuron = self.architecture.evaluate(x, params)   # (N, n_pts)
         return self._c_N * per_neuron.sum(axis=0)            # (n_pts,)
 
-    def sample_field(self, x_points, n_samples, rng, sampler=None):
+    def log_prior(self, params):
+        """Joint log-density of `params` under the i.i.d. baseline.
+
+        Sums independent log-probs across all entries of every parameter.
+        Override (or pass interdependent terms via a subclass) when the
+        prior factorizes non-trivially; MetropolisHastingsSampler will
+        target whatever this returns.
+        """
+        total = 0.0
+        for name, dist in self._param_dists.items():
+            total = total + jnp.sum(dist.log_prob(params[name]))
+        return total
+
+    def sample_field(self, x_points, n_samples, key, sampler=None):
         """Field values at multiple points, shape (n_samples, n_pts).
 
-        Each parameter draw produces values at all x_points simultaneously.
+        One vmap'd evaluation per parameter draw.
         """
         sampler = sampler if sampler is not None else IIDSampler()
-        x = np.atleast_2d(np.asarray(x_points, dtype=float))
-        out = np.empty((n_samples, x.shape[0]))
-        for i, params in enumerate(sampler.sample(self, n_samples, rng)):
-            out[i] = self.evaluate(x, params)
-        return out
+        x = jnp.atleast_2d(jnp.asarray(x_points, dtype=jnp.float32))
+        params = sampler.sample(self, n_samples, key)
+        eval_one = lambda p: self.evaluate(x, p)
+        return jax.vmap(eval_one)(params)                    # (n_samples, n_pts)
 
-    # correlators ---------------------------------------------------------
+    # ---- correlators ----
     def correlator(
         self,
         x_points,
         n_samples,
-        rng,
+        key,
         sampler=None,
         connected=False,
         bootstrap=200,
     ):
         """Monte-Carlo estimate of G^(n)(x_1,...,x_n), n = len(x_points).
 
-        Returns (value, stderr).
+        Returns (value, stderr) as Python floats.
         - connected=False: ordinary moment, stderr from sample std / sqrt(n).
         - connected=True : cumulant via moments-to-cumulants formula;
                            stderr from `bootstrap` resamples.
         """
-        samples = self.sample_field(x_points, n_samples, rng, sampler=sampler)
+        samples = self.sample_field(x_points, n_samples, key, sampler=sampler)
         if not connected:
-            prod = np.prod(samples, axis=1)
-            return float(prod.mean()), float(prod.std(ddof=1) / np.sqrt(n_samples))
-        value = _cumulant_from_samples(samples)
-        # bootstrap stderr
-        boot_rng = np.random.default_rng(rng.integers(0, 2**63 - 1))
-        vals = np.empty(bootstrap)
-        for k in range(bootstrap):
-            idx = boot_rng.integers(0, n_samples, size=n_samples)
-            vals[k] = _cumulant_from_samples(samples[idx])
-        return float(value), float(vals.std(ddof=1))
+            prod = jnp.prod(samples, axis=1)
+            value = float(prod.mean())
+            stderr = float(jnp.std(prod, ddof=1) / jnp.sqrt(n_samples))
+            return value, stderr
+
+        value = float(_cumulant_from_samples(samples))
+        boot_key = jax.random.fold_in(key, 0xB007)
+        n = samples.shape[0]
+        boot_keys = jax.random.split(boot_key, bootstrap)
+        boot_vals = jnp.array(
+            [
+                _cumulant_from_samples(
+                    samples[jax.random.randint(bk, (n,), 0, n)]
+                )
+                for bk in boot_keys
+            ]
+        )
+        return value, float(jnp.std(boot_vals, ddof=1))
 
 
 def _cumulant_from_samples(samples):
-    """Connected n-point function from samples (n_samples, n) via set partitions.
+    """Connected n-point function via set-partition moments-to-cumulants.
 
     kappa_n = sum_{pi} (-1)^{|pi|-1} (|pi|-1)! prod_{B in pi} E[prod_{i in B} phi_i]
     """
     n = samples.shape[1]
-    # cache moments E[prod_{i in B} phi_i] for each subset B (as frozenset).
     moments = {}
     total = 0.0
     for partition in _set_partitions(n):
@@ -154,8 +165,8 @@ def _cumulant_from_samples(samples):
         term = 1.0
         for block in partition:
             if block not in moments:
-                cols = list(block)
-                moments[block] = float(np.prod(samples[:, cols], axis=1).mean())
-            term *= moments[block]
-        total += sign * term
+                cols = jnp.array(sorted(block))
+                moments[block] = jnp.mean(jnp.prod(samples[:, cols], axis=1))
+            term = term * moments[block]
+        total = total + sign * term
     return total

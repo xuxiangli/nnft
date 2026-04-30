@@ -1,14 +1,14 @@
-"""NNFT sampling package."""
+"""NNFT sampling package (JAX backend)."""
 
 from .architectures import (
-    # Architecture,
+    Architecture,
     CosNet,
     DenseTanh,
-    # Distribution,
+    Distribution,
     Normal,
     Uniform,
 )
-from .samplers import IIDSampler, Sampler
+from .samplers import IIDSampler, MetropolisHastingsSampler, Sampler
 from .theory import Theory
 
 __all__ = [
@@ -17,6 +17,7 @@ __all__ = [
     "DenseTanh",
     "Distribution",
     "IIDSampler",
+    "MetropolisHastingsSampler",
     "Normal",
     "Sampler",
     "Theory",
