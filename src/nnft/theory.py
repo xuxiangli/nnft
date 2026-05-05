@@ -193,6 +193,117 @@ class Theory:
             return float(mean[0]), float(stderr[0])
         return mean, stderr
 
+    def correlator_reweighted(
+        self,
+        x_points,
+        n_samples,
+        rng,
+        interaction,
+        *,
+        sampler=None,
+        n_configs=1,
+        batch_size=None,
+        action_method="real_space_mc",
+        action_kwargs=None,
+    ):
+        """Estimate <phi(x_1)...phi(x_n)>_{S_int} by free-theory reweighting.
+
+        Draws theta from the free-theory PDF (default IIDSampler) and weights
+        each sample by w = exp(-S_int(theta)). Returns (mean, stderr) where
+        the mean is the weighted Monte-Carlo estimator
+            <O> = <w O> / <w>
+        and stderr is the delta-method standard error of that ratio.
+
+        x_points: (n_configs * n_corr, d_in) -- n_configs disconnected groups
+                  of n_corr query points each, exactly as in `correlator`.
+        """
+        sampler = sampler if sampler is not None else IIDSampler()
+        action_kwargs = dict(action_kwargs) if action_kwargs else {}
+
+        x = np.atleast_2d(np.asarray(x_points, dtype=float))
+        n_pts = x.shape[0]
+        if n_pts % n_configs != 0:
+            raise ValueError(
+                f"len(x_points)={n_pts} must be a multiple of n_configs={n_configs}"
+            )
+        n_corr = n_pts // n_configs
+        bs = int(batch_size) if batch_size is not None else int(n_samples)
+
+        # If real-space MC quadrature, fix the quadrature points across batches
+        # so that the reweighting is well-defined (a single estimator over a
+        # fixed S_int functional rather than a noisy random functional per
+        # batch). Hermite is deterministic anyway.
+        x_quad = action_kwargs.pop("x_quad", None)
+        quad_weights = action_kwargs.pop("quad_weights", None)
+        if action_method == "real_space_mc" and x_quad is None:
+            M_x = action_kwargs.get("M_x")
+            if M_x is None:
+                raise ValueError("action_kwargs must include M_x for real_space_mc")
+            x_quad = interaction.draw_mc_points(
+                self.architecture.d_in, int(M_x), rng
+            )
+        if action_method == "real_space_hermite" and x_quad is None:
+            n_h = action_kwargs.get("n_hermite")
+            if n_h is None:
+                raise ValueError(
+                    "action_kwargs must include n_hermite for real_space_hermite"
+                )
+            x_quad, quad_weights = interaction.hermite_points(
+                self.architecture.d_in, int(n_h)
+            )
+
+        sum_wO = np.zeros(n_configs)  # for <w O> numerator
+        sum_w = 0.0                 # for <w> denominator
+        sum_wO_sq = np.zeros(n_configs)
+        sum_w_sq = 0.0
+        sum_wO_w = np.zeros(n_configs)  # for cov(<wO>, <w>)
+        n_total = 0
+
+        done = 0
+        while done < n_samples:
+            b = min(bs, n_samples - done)
+            params = sampler.sample(self, b, rng)
+            phi = self.evaluate(x, params, b=b)                  # (b, n_pts)
+            prod = phi.reshape(b, n_configs, n_corr).prod(axis=2)  # (b, n_configs)
+
+            S = interaction.action(
+                self, params, b,
+                method=action_method,
+                x_quad=x_quad, quad_weights=quad_weights,
+                **action_kwargs,
+            )                                                     # (b,)
+            # numerical guard: subtract a running max to keep weights bounded.
+            w = np.exp(-S)                                        # (b,)
+
+            sum_wO += (w[:, None] * prod).sum(axis=0)
+            sum_w += float(w.sum())
+            sum_wO_sq += ((w[:, None] * prod) ** 2).sum(axis=0)
+            sum_w_sq += float((w * w).sum())
+            sum_wO_w += (w * w[:, None] * prod / 1.0).sum(axis=0) if False else (
+                (w * w)[:, None] * prod
+            ).sum(axis=0)
+            n_total += b
+            done += b
+
+        mean_wO = sum_wO / n_total
+        mean_w = sum_w / n_total
+        ratio = mean_wO / mean_w
+
+        # delta-method stderr for ratio
+        var_wO = (sum_wO_sq - n_total * mean_wO * mean_wO) / max(n_total - 1, 1)
+        var_w = (sum_w_sq - n_total * mean_w * mean_w) / max(n_total - 1, 1)
+        cov = (sum_wO_w - n_total * mean_wO * mean_w) / max(n_total - 1, 1)
+        var_ratio = (
+            var_wO / (mean_w ** 2)
+            - 2.0 * ratio * cov / (mean_w ** 2)
+            + (ratio ** 2) * var_w / (mean_w ** 2)
+        ) / n_total
+        stderr = np.sqrt(np.maximum(var_ratio, 0.0))
+
+        if n_configs == 1:
+            return float(ratio[0]), float(stderr[0])
+        return ratio, stderr
+
 
 def _cumulant_from_samples(samples):
     """Connected n-point function from samples (n_samples, n) via set partitions."""

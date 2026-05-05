@@ -1,6 +1,15 @@
 """NNFT sampling package."""
 
-from .analytics import G2_free, G4_free, f_Lambda, omega_alpha
+from .analytics import (
+    G2_free,
+    G2_lambda_phi4_one_loop_ir,
+    G2_lambda_phi4_one_loop_no_ir,
+    G4_free,
+    f_Lambda,
+    omega_alpha,
+    propagator,
+    propagator_resummed,
+)
 from .architectures import (
     Architecture,
     Constant,
@@ -14,7 +23,8 @@ from .architectures import (
     UniSphere,
     Uniform,
 )
-from .samplers import IIDSampler, Sampler
+from .interactions import LambdaPhi4
+from .samplers import IIDSampler, MetropolisHastingsSampler, Sampler
 from .theory import Theory
 
 __all__ = [
@@ -25,8 +35,12 @@ __all__ = [
     "DenseTanh",
     "Distribution",
     "G2_free",
+    "G2_lambda_phi4_one_loop_ir",
+    "G2_lambda_phi4_one_loop_no_ir",
     "G4_free",
     "IIDSampler",
+    "LambdaPhi4",
+    "MetropolisHastingsSampler",
     "Normal",
     "RegulatedMomentum",
     "Sampler",
@@ -36,4 +50,6 @@ __all__ = [
     "Uniform",
     "f_Lambda",
     "omega_alpha",
+    "propagator",
+    "propagator_resummed",
 ]

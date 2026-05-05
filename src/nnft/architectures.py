@@ -23,7 +23,17 @@ class Distribution:
 
     def sample(self, size, rng):
         return self._rv.rvs(size=size, random_state=rng)
-    
+
+    def log_pdf(self, x):
+        """Log density at x. Override in subclasses; the adapter form falls back
+        to the wrapped scipy frozen distribution's logpdf when available."""
+        if hasattr(self._rv, "logpdf"):
+            return np.asarray(self._rv.logpdf(np.asarray(x)))
+        raise NotImplementedError(
+            f"{type(self).__name__} has no log_pdf; override or wrap a scipy "
+            f"frozen distribution"
+        )
+
 
 class Constant(Distribution):
     """Degenerate distribution returning a fixed scalar value."""
@@ -33,6 +43,10 @@ class Constant(Distribution):
 
     def sample(self, size, rng):
         return np.full(size, self.value)
+
+    def log_pdf(self, x):
+        x = np.asarray(x, dtype=float)
+        return np.where(x == self.value, 0.0, -np.inf)
 
 
 class Uniform(Distribution):
@@ -49,6 +63,11 @@ class Uniform(Distribution):
     def sample(self, size, rng):
         return rng.uniform(self.low, self.high, size=size)
 
+    def log_pdf(self, x):
+        x = np.asarray(x, dtype=float)
+        in_range = (x >= self.low) & (x <= self.high)
+        return np.where(in_range, -np.log(self.length), -np.inf)
+
 
 class Normal(Distribution):
     def __init__(self, mu=0.0, sigma=1.0):
@@ -62,6 +81,12 @@ class Normal(Distribution):
 
     def sample(self, size, rng):
         return rng.normal(self.mu, self.sigma, size=size)
+
+    def log_pdf(self, x):
+        x = np.asarray(x, dtype=float)
+        return -0.5 * ((x - self.mu) / self.sigma) ** 2 - 0.5 * np.log(
+            2.0 * np.pi
+        ) - np.log(self.sigma)
 
 
 class UniBall(Distribution):
@@ -154,6 +179,27 @@ class RegulatedMomentum(Distribution):
         r = self._sample_radii(n, rng)
         directions = self._direction.sample((n,), rng)
         return r[:, None] * directions
+
+    def log_pdf(self, x):
+        """Unnormalized log-density of k in R^d up to a constant.
+
+        log p(k) = log f_Lambda(k^2) - (alpha+1) log(k^2 + m^2) - log Z,
+        Z = (2 pi)^d Omega_alpha (so that the marginalized k^2 sampler matches
+        the closed-form Omega_alpha used by CosNetFT).
+        """
+        k = np.asarray(x, dtype=float)
+        ksq = np.sum(k * k, axis=-1)
+        if self.regulator == "hard":
+            inside = ksq <= self.Lambda * self.Lambda
+            log_freg = np.where(inside, 0.0, -np.inf)
+        elif self.regulator == "gaussian":
+            log_freg = -ksq / (2.0 * self.Lambda * self.Lambda)
+        else:  # "none"
+            log_freg = np.zeros_like(ksq)
+        # closed-form Omega_alpha matches CosNetFT's normalization
+        Omega = omega_alpha(self.d, self.m, self.alpha, self.Lambda, self.regulator)
+        log_Z = self.d * np.log(2.0 * np.pi) + np.log(Omega)
+        return log_freg - (self.alpha + 1.0) * np.log(ksq + self.m * self.m) - log_Z
 
 
 class Architecture(ABC):
