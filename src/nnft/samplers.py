@@ -61,6 +61,7 @@ class MetropolisHastingsSampler(Sampler):
         init_sampler=None,
         action_method="real_space_mc",
         action_kwargs=None,
+        resample_x_per_sweep=False,
     ):
         if proposal_mode not in ("all", "single"):
             raise ValueError(f"unknown proposal_mode {proposal_mode!r}")
@@ -72,6 +73,7 @@ class MetropolisHastingsSampler(Sampler):
         self.init_sampler = init_sampler if init_sampler is not None else IIDSampler()
         self.action_method = action_method
         self.action_kwargs = dict(action_kwargs) if action_kwargs else {}
+        self.resample_x_per_sweep = bool(resample_x_per_sweep)
 
         # Lazy chain state, materialized on first `sample` call.
         self._theory = None
@@ -202,8 +204,24 @@ class MetropolisHastingsSampler(Sampler):
                 total += float(np.sum(lp))
         return total
 
+    def _maybe_resample_x_quad(self, rng):
+        """Redraw real-space MC quadrature points and refresh cached Phi/S_int."""
+        if not self.resample_x_per_sweep:
+            return
+        if self.action_method != "real_space_mc":
+            return
+        M_x = self.action_kwargs.get("M_x")
+        if M_x is None:
+            return
+        self._x_quad = self.interaction.draw_mc_points(
+            self._theory.architecture.d_in, int(M_x), rng
+        )
+        self._Phi = self._compute_Phi(self._state)
+        self._S_int = self._S_int_from_Phi(self._Phi)
+
     # ----- one MH step -----------------------------------------------------
     def _step(self, rng):
+        self._maybe_resample_x_quad(rng)
         if self.proposal_mode == "all":
             self._step_all(rng)
         else:

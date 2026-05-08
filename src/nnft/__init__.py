@@ -1,6 +1,8 @@
 """NNFT sampling package."""
 
 from .analytics import (
+    AnalFree,
+    AnalPhi4,
     G2_free,
     G2_lambda_phi4_one_loop_ir,
     G2_lambda_phi4_one_loop_no_ir,

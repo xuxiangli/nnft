@@ -8,6 +8,7 @@ sums) that share parameters and validate against each other on small N.
 
 import numpy as np
 from scipy import special
+from scipy.spatial import cKDTree
 
 
 _IR_REGULATORS = ("gaussian",)
@@ -34,7 +35,7 @@ class LambdaPhi4:
     # ----- public entry point --------------------------------------------
     def action(self, theory, params, b, *, method="real_space_mc",
                M_x=None, n_hermite=None, rng=None,
-               x_quad=None, quad_weights=None):
+               x_quad=None, quad_weights=None, eps=1e-8, k_cut=None):
         """Return S_int per batch element, shape (b,).
 
         Args:
@@ -43,10 +44,12 @@ class LambdaPhi4:
                     (b * N, *spec_shape) (the standard packed layout).
             b:      number of independent param configurations packed in params.
             method: one of "real_space_mc", "real_space_hermite",
-                    "explicit", "symmetry_reduced".
+                    "explicit", "symmetry_reduced", "momentum_conservation".
             M_x, n_hermite, rng: method-specific options (see _action_*).
             x_quad, quad_weights: optional cached quadrature for the real-space
                 methods. If x_quad is given, it overrides M_x / n_hermite.
+            eps, k_cut: method-specific options for "momentum_conservation".
+                If k_cut is None, use sqrt(2 log(1/eps)) / L.
         """
         if method == "real_space_mc":
             if x_quad is not None:
@@ -80,6 +83,10 @@ class LambdaPhi4:
             return self._action_explicit(theory, params, b)
         if method == "symmetry_reduced":
             return self._action_symmetry_reduced(theory, params, b)
+        if method == "momentum_conservation":
+            return self._action_momentum_conservation(
+                theory, params, b, eps=eps, k_cut=k_cut
+            )
         raise ValueError(f"unknown method {method!r}")
 
     # ----- quadrature helpers --------------------------------------------
@@ -196,3 +203,133 @@ class LambdaPhi4:
         # for the requested validation use, just defer to the explicit form;
         # included as an alias to make the API surface match the plan.
         return self._action_explicit(theory, params, b)
+
+    # ----- approximate momentum-conservation summation -------------------
+    def _action_momentum_conservation(self, theory, params, b, *, eps, k_cut):
+        """Sparse signed-pair sum using approximate momentum conservation.
+
+        The Gaussian IR factor suppresses modes with total momentum
+        |K| >> 1/L. This method keeps only signed-pair combinations satisfying
+        |P_a + P_b| <= k_cut, where the default cutoff makes the omitted
+        Gaussian factor no larger than eps per term.
+        """
+        d = theory.architecture.d_in
+        N = theory.N
+        if k_cut is None:
+            eps = float(eps)
+            if not 0.0 < eps < 1.0:
+                raise ValueError("eps must satisfy 0 < eps < 1")
+            k_cut = np.sqrt(2.0 * np.log(1.0 / eps)) / self.L
+        k_cut = float(k_cut)
+        if k_cut < 0.0:
+            raise ValueError("k_cut must be non-negative")
+
+        out = np.empty(b, dtype=float)
+        for bi in range(b):
+            sl = slice(bi * N, (bi + 1) * N)
+            out[bi] = self._momentum_conservation_one(
+                d, params, sl, theory, k_cut
+            )
+        return out
+
+    def _momentum_conservation_one(self, d, params, sl, theory, k_cut):
+        pair_momenta, pair_coeffs = self._signed_pair_momenta_and_coeffs(
+            params, sl, theory, representative=not np.isinf(k_cut)
+        )
+        gamma = 0.5 * self.L * self.L
+
+        if np.isinf(k_cut):
+            total = self._dense_signed_pair_sum(pair_momenta, pair_coeffs, gamma)
+        else:
+            total = self._sparse_representative_pair_sum(
+                pair_momenta, pair_coeffs, gamma, k_cut
+            )
+
+        prefactor = (
+            self.lambda_
+            * (2.0 * np.pi) ** (d / 2.0)
+            * self.L ** d
+            * theory._c_N ** 4
+            / 24.0
+        )
+        return float(prefactor * np.real(total))
+
+    def _signed_pair_momenta_and_coeffs(
+        self, params, sl, theory, *, representative=False
+    ):
+        """Return ordered signed pair momenta and complex coefficients.
+
+        Pair labels are ordered ``(i, j, sigma, tau)`` with
+        ``P = sigma k_i + tau k_j`` and
+        ``C = u_i^sigma u_j^tau`` where
+        ``u_i^sigma = 0.5 * a_i * exp(i sigma b_i)``. If representative is
+        true, return only the sigma=+1 blocks; the sparse summation reconstructs
+        the sigma=-1 conjugate blocks analytically.
+        """
+        arch = theory.architecture
+        k = np.asarray(params["W0"][sl], dtype=float)
+        b0 = np.asarray(params["b0"][sl], dtype=float)
+        if hasattr(arch, "alpha"):
+            W1 = np.asarray(params["W1"][sl], dtype=float)
+            w1 = W1 * (np.sum(k * k, axis=-1) + arch.m * arch.m) ** (
+                arch.alpha / 2.0
+            )
+        else:
+            w1 = np.asarray(params["W1"][sl], dtype=float)
+
+        N, d = k.shape
+        NN = N * N
+        sign_pairs = (
+            ((1.0, 1.0), (1.0, -1.0))
+            if representative
+            else ((1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0))
+        )
+        pair_momenta = np.empty((len(sign_pairs) * NN, d), dtype=float)
+        pair_coeffs = np.empty(len(sign_pairs) * NN, dtype=np.complex128)
+        signed_coeffs = {
+            1.0: 0.5 * w1 * np.exp(1j * b0),
+            -1.0: 0.5 * w1 * np.exp(-1j * b0),
+        }
+
+        for block, (sigma, tau) in enumerate(sign_pairs):
+            start = block * NN
+            stop = start + NN
+            pair_momenta[start:stop] = (
+                sigma * k[:, None, :] + tau * k[None, :, :]
+            ).reshape(NN, d)
+            pair_coeffs[start:stop] = (
+                signed_coeffs[sigma][:, None] * signed_coeffs[tau][None, :]
+            ).reshape(NN)
+        return pair_momenta, pair_coeffs
+
+    def _sparse_representative_pair_sum(
+        self, pair_momenta, pair_coeffs, gamma, k_cut
+    ):
+        tree = cKDTree(pair_momenta)
+
+        plus = tree.sparse_distance_matrix(
+            cKDTree(-pair_momenta), k_cut, output_type="coo_matrix"
+        )
+        plus_weights = np.exp(-gamma * plus.data * plus.data)
+        plus_total = np.sum(
+            pair_coeffs[plus.row] * pair_coeffs[plus.col] * plus_weights
+        )
+
+        diff = tree.sparse_distance_matrix(tree, k_cut, output_type="coo_matrix")
+        diff_weights = np.exp(-gamma * diff.data * diff.data)
+        diff_total = np.sum(
+            pair_coeffs[diff.row]
+            * np.conjugate(pair_coeffs[diff.col])
+            * diff_weights
+        )
+        return 2.0 * np.real(plus_total + diff_total)
+
+    def _dense_signed_pair_sum(self, pair_momenta, pair_coeffs, gamma):
+        total = 0.0 + 0.0j
+        for idx in range(pair_momenta.shape[0]):
+            K = pair_momenta[idx] + pair_momenta
+            Ksq = np.sum(K * K, axis=1)
+            total += pair_coeffs[idx] * np.sum(
+                pair_coeffs * np.exp(-gamma * Ksq)
+            )
+        return total
