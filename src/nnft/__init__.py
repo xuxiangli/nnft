@@ -26,7 +26,13 @@ from .architectures import (
     Uniform,
 )
 from .interactions import LambdaPhi4
-from .samplers import IIDSampler, MetropolisHastingsSampler, Sampler
+from .samplers import (
+    HMCSampler,
+    IIDSampler,
+    MALASampler,
+    MetropolisHastingsSampler,
+    Sampler,
+)
 from .theory import Theory
 
 __all__ = [
@@ -40,8 +46,10 @@ __all__ = [
     "G2_lambda_phi4_one_loop_ir",
     "G2_lambda_phi4_one_loop_no_ir",
     "G4_free",
+    "HMCSampler",
     "IIDSampler",
     "LambdaPhi4",
+    "MALASampler",
     "MetropolisHastingsSampler",
     "Normal",
     "RegulatedMomentum",

@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from .architectures import Constant, Uniform
+
 
 class Sampler(ABC):
     """Draws parameter realizations for a Theory."""
@@ -363,3 +365,343 @@ class MetropolisHastingsSampler(Sampler):
         old_per_neuron = theory.architecture.evaluate(self._x_quad, old_state)  # (1, n_q)
         new_per_neuron = theory.architecture.evaluate(self._x_quad, new_state)  # (1, n_q)
         return self._Phi + c_N * (new_per_neuron[0] - old_per_neuron[0])
+
+
+class _GradientChainBase(Sampler):
+    """Shared chain plumbing for gradient-based samplers (HMC, MALA).
+
+    Maintains state (theta, S_int, log_prior, S_grad, lp_grad). For
+    `action_method="real_space_mc"` a fixed quadrature `x_quad` is cached.
+    For `action_method="trans_sym"` the action+grad are recomputed from
+    scratch each call (no cached pair tree — pair momenta change with
+    every k_i). Subclasses implement `_step(rng)`.
+
+    log_prior / lp_grad EXCLUDE Uniform contributions: the Uniform on b0
+    represents a periodic angle (cos/sin are 2pi-periodic) and the dynamics
+    live on the universal cover. The Uniform support check is therefore
+    skipped — leaving b0 unwrapped is consistent with the target density and
+    avoids a discontinuity. Hard-cutoff Uniforms on k would be wrong here;
+    use the Gaussian UV regulator.
+    """
+
+    _SUPPORTED_METHODS = ("real_space_mc", "trans_sym")
+
+    def __init__(
+        self,
+        interaction,
+        *,
+        burn_in,
+        thin,
+        init_sampler,
+        action_method,
+        action_kwargs,
+        resample_x_per_step,
+        update_W1,
+    ):
+        if action_method not in self._SUPPORTED_METHODS:
+            raise NotImplementedError(
+                f"gradient-based samplers support {self._SUPPORTED_METHODS}, "
+                f"got {action_method!r}"
+            )
+        self.interaction = interaction
+        self.burn_in = int(burn_in)
+        self.thin = int(thin)
+        self.init_sampler = init_sampler if init_sampler is not None else IIDSampler()
+        self.action_method = action_method
+        self.action_kwargs = dict(action_kwargs) if action_kwargs else {}
+        if action_method == "real_space_mc" and "M_x" not in self.action_kwargs:
+            raise ValueError("action_kwargs must include M_x for real_space_mc")
+        self.resample_x_per_step = bool(resample_x_per_step)
+        self.update_W1 = bool(update_W1)
+
+        self._theory = None
+        self._state = None
+        self._S_int = None
+        self._log_prior = None
+        self._x_quad = None
+        self._S_grad = None
+        self._lp_grad = None
+        self._n_accept = 0
+        self._n_propose = 0
+
+    @property
+    def acceptance_rate(self):
+        if self._n_propose == 0:
+            return float("nan")
+        return self._n_accept / self._n_propose
+
+    def _updated_names(self):
+        out = []
+        for name, dist in self._theory.param_dists.items():
+            if isinstance(dist, Constant) and not self.update_W1:
+                continue
+            out.append(name)
+        return out
+
+    def _action_and_grad(self, state):
+        flat = {k: v for k, v in state.items()}
+        kw = {}
+        if self.action_method == "real_space_mc":
+            kw["x_quad"] = self._x_quad
+        else:  # trans_sym
+            for key in ("eps", "k_cut"):
+                if key in self.action_kwargs:
+                    kw[key] = self.action_kwargs[key]
+        S, grads = self.interaction.action_and_grad(
+            self._theory, flat, b=1, method=self.action_method, **kw,
+        )
+        return float(S[0]), grads
+
+    def _log_prior_and_grad(self, state):
+        """Sum log_pdf and gradient over distributions, skipping Uniform.
+
+        Returns (-inf, ...) if any non-Uniform distribution puts the state
+        outside its support (e.g. a hard-cutoff RegulatedMomentum).
+        """
+        total = 0.0
+        grads = {}
+        finite = True
+        for name, dist in self._theory.param_dists.items():
+            x = state[name]
+            grads[name] = np.zeros_like(x, dtype=float)
+            if isinstance(dist, Uniform):
+                continue
+            if isinstance(dist, Constant):
+                continue
+            lp = dist.log_pdf(x)
+            if np.any(np.isneginf(lp)):
+                finite = False
+            else:
+                total += float(np.sum(lp))
+            if hasattr(dist, "grad_log_pdf"):
+                g = dist.grad_log_pdf(x)
+                grads[name] = np.asarray(g, dtype=float)
+        if not finite:
+            return -np.inf, grads
+        return total, grads
+
+    def _maybe_resample_xq(self, rng):
+        if not self.resample_x_per_step:
+            return
+        if self.action_method != "real_space_mc":
+            return
+        M_x = self.action_kwargs["M_x"]
+        self._x_quad = self.interaction.draw_mc_points(
+            self._theory.architecture.d_in, int(M_x), rng
+        )
+        self._S_int, self._S_grad = self._action_and_grad(self._state)
+
+    def _init_chain(self, theory, rng):
+        N = theory.N
+        spec = theory.architecture.param_spec
+        params = self.init_sampler.sample(theory, 1, rng)
+        self._state = {name: params[name].reshape((N,) + shape)
+                       for name, shape in spec.items()}
+        self._theory = theory
+        if self.action_method == "real_space_mc":
+            M_x = self.action_kwargs["M_x"]
+            self._x_quad = self.interaction.draw_mc_points(
+                theory.architecture.d_in, int(M_x), rng
+            )
+        self._S_int, self._S_grad = self._action_and_grad(self._state)
+        self._log_prior, self._lp_grad = self._log_prior_and_grad(self._state)
+        for _ in range(self.burn_in):
+            self._step(rng)
+
+    @abstractmethod
+    def _step(self, rng):
+        ...
+
+    def sample(self, theory, n_samples, rng):
+        spec = theory.architecture.param_spec
+        if self._theory is not theory:
+            self._init_chain(theory, rng)
+        out = {name: np.empty((n_samples,) + (theory.N,) + shape, dtype=float)
+               for name, shape in spec.items()}
+        for s in range(n_samples):
+            for _ in range(self.thin):
+                self._step(rng)
+            for name in spec:
+                out[name][s] = self._state[name]
+        return {name: arr.reshape((n_samples * theory.N,) + shape)
+                for (name, shape), arr in zip(spec.items(),
+                                              [out[k] for k in spec])}
+
+
+class HMCSampler(_GradientChainBase):
+    """Hamiltonian Monte Carlo over (W0, b0).
+
+    H(theta, p) = U(theta) + 0.5 * sum_n p_n^2 / mass_n,
+    U(theta) = -log P_G(theta) + S_int(theta).
+
+    `step_size` and `mass` are dicts keyed by parameter name (W0, b0). One
+    full step = `n_leapfrog` leapfrog updates followed by a Metropolis
+    accept/reject on the change in H. W1 is held fixed (CosNetFT pins it to
+    sqrt(2 Omega_alpha)); the gradient through w_i = W1 (|k|^2 + m^2)^{a/2}
+    enters via ∂S_int/∂W0 only.
+    """
+
+    def __init__(
+        self,
+        interaction,
+        *,
+        step_size,
+        n_leapfrog,
+        mass=None,
+        burn_in=200,
+        thin=1,
+        init_sampler=None,
+        action_method="real_space_mc",
+        action_kwargs=None,
+        resample_x_per_step=False,
+        update_W1=False,
+    ):
+        super().__init__(
+            interaction,
+            burn_in=burn_in, thin=thin, init_sampler=init_sampler,
+            action_method=action_method, action_kwargs=action_kwargs,
+            resample_x_per_step=resample_x_per_step, update_W1=update_W1,
+        )
+        self.step_size = dict(step_size)
+        self.n_leapfrog = int(n_leapfrog)
+        self.mass = dict(mass) if mass else {}
+
+    def _grad_U(self, S_grad, lp_grad, names):
+        # ∇U = ∇S_int - ∇log P_G
+        return {n: S_grad[n] - lp_grad[n] for n in names}
+
+    def _step(self, rng):
+        self._maybe_resample_xq(rng)
+        names = self._updated_names()
+        steps = {n: float(self.step_size[n]) for n in names}
+        masses = {n: float(self.mass.get(n, 1.0)) for n in names}
+
+        # snapshot for restore on reject
+        state0 = {n: self._state[n].copy() for n in self._state}
+        S0 = self._S_int
+        lp0 = self._log_prior
+        S_grad0 = {k: v.copy() for k, v in self._S_grad.items()}
+        lp_grad0 = {k: v.copy() for k, v in self._lp_grad.items()}
+
+        # draw momentum p ~ N(0, mass)
+        p = {n: rng.normal(scale=np.sqrt(masses[n]),
+                           size=self._state[n].shape) for n in names}
+        KE0 = 0.5 * sum(np.sum(p[n] ** 2) / masses[n] for n in names)
+        H0 = (-lp0 + S0) + KE0
+
+        gradU = self._grad_U(self._S_grad, self._lp_grad, names)
+        # half kick
+        for n in names:
+            p[n] = p[n] - 0.5 * steps[n] * gradU[n]
+
+        ok = True
+        for step_i in range(self.n_leapfrog):
+            for n in names:
+                self._state[n] = self._state[n] + steps[n] * p[n] / masses[n]
+            self._log_prior, self._lp_grad = self._log_prior_and_grad(self._state)
+            if not np.isfinite(self._log_prior):
+                ok = False
+                break
+            self._S_int, self._S_grad = self._action_and_grad(self._state)
+            gradU = self._grad_U(self._S_grad, self._lp_grad, names)
+            kick = 0.5 if step_i == self.n_leapfrog - 1 else 1.0
+            for n in names:
+                p[n] = p[n] - kick * steps[n] * gradU[n]
+
+        self._n_propose += 1
+        if not ok:
+            self._state = state0
+            self._S_int = S0
+            self._log_prior = lp0
+            self._S_grad = S_grad0
+            self._lp_grad = lp_grad0
+            return
+
+        KE_new = 0.5 * sum(np.sum(p[n] ** 2) / masses[n] for n in names)
+        H_new = (-self._log_prior + self._S_int) + KE_new
+        log_alpha = H0 - H_new
+        if np.log(rng.uniform()) < log_alpha:
+            self._n_accept += 1
+        else:
+            self._state = state0
+            self._S_int = S0
+            self._log_prior = lp0
+            self._S_grad = S_grad0
+            self._lp_grad = lp_grad0
+
+
+class MALASampler(_GradientChainBase):
+    """Metropolis-adjusted Langevin algorithm.
+
+    Proposal: theta' = theta + tau * grad(log P) + sqrt(2 tau) * xi, xi ~ N(0, I).
+    Asymmetric MH correction with q(theta'|theta) ∝ exp(-|theta'-theta-tau g|^2/(4 tau)).
+
+    `tau` is a dict keyed by parameter name (per-name preconditioning);
+    typical scales are tau_b ~ 1 for b0, tau_k ~ 1/Lambda^2 for W0.
+    """
+
+    def __init__(
+        self,
+        interaction,
+        *,
+        tau,
+        burn_in=500,
+        thin=1,
+        init_sampler=None,
+        action_method="real_space_mc",
+        action_kwargs=None,
+        resample_x_per_step=False,
+        update_W1=False,
+    ):
+        super().__init__(
+            interaction,
+            burn_in=burn_in, thin=thin, init_sampler=init_sampler,
+            action_method=action_method, action_kwargs=action_kwargs,
+            resample_x_per_step=resample_x_per_step, update_W1=update_W1,
+        )
+        self.tau = dict(tau)
+
+    def _grad_log_P(self, S_grad, lp_grad, names):
+        # ∇log P = ∇log P_G - ∇S_int
+        return {n: lp_grad[n] - S_grad[n] for n in names}
+
+    def _step(self, rng):
+        self._maybe_resample_xq(rng)
+        names = self._updated_names()
+        taus = {n: float(self.tau[n]) for n in names}
+
+        glog = self._grad_log_P(self._S_grad, self._lp_grad, names)
+        proposed = {k: v.copy() for k, v in self._state.items()}
+        for n in names:
+            xi = rng.normal(size=self._state[n].shape)
+            proposed[n] = (
+                self._state[n] + taus[n] * glog[n]
+                + np.sqrt(2.0 * taus[n]) * xi
+            )
+
+        new_lp, new_lp_grad = self._log_prior_and_grad(proposed)
+        self._n_propose += 1
+        if not np.isfinite(new_lp):
+            return
+        new_S, new_S_grad = self._action_and_grad(proposed)
+        new_glog = self._grad_log_P(new_S_grad, new_lp_grad, names)
+
+        log_q_fwd = 0.0
+        log_q_bwd = 0.0
+        for n in names:
+            d_fwd = proposed[n] - self._state[n] - taus[n] * glog[n]
+            d_bwd = self._state[n] - proposed[n] - taus[n] * new_glog[n]
+            log_q_fwd += -float(np.sum(d_fwd * d_fwd)) / (4.0 * taus[n])
+            log_q_bwd += -float(np.sum(d_bwd * d_bwd)) / (4.0 * taus[n])
+
+        log_alpha = (
+            (new_lp - new_S) - (self._log_prior - self._S_int)
+            + (log_q_bwd - log_q_fwd)
+        )
+        if np.log(rng.uniform()) < log_alpha:
+            self._state = proposed
+            self._S_int = new_S
+            self._S_grad = new_S_grad
+            self._log_prior = new_lp
+            self._lp_grad = new_lp_grad
+            self._n_accept += 1

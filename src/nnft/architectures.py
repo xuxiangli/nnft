@@ -34,6 +34,10 @@ class Distribution:
             f"frozen distribution"
         )
 
+    def grad_log_pdf(self, x):
+        """Gradient of log_pdf w.r.t. x; default zero (override where needed)."""
+        return np.zeros_like(np.asarray(x, dtype=float))
+
 
 class Constant(Distribution):
     """Degenerate distribution returning a fixed scalar value."""
@@ -200,6 +204,24 @@ class RegulatedMomentum(Distribution):
         Omega = omega_alpha(self.d, self.m, self.alpha, self.Lambda, self.regulator)
         log_Z = self.d * np.log(2.0 * np.pi) + np.log(Omega)
         return log_freg - (self.alpha + 1.0) * np.log(ksq + self.m * self.m) - log_Z
+
+    def grad_log_pdf(self, x):
+        """∇_k log p(k) for k of shape (..., d). Returns same shape.
+
+        log p(k) = log f_Lambda(k^2) - (alpha+1) log(k^2+m^2) + const
+        ⇒ ∇_k log p = [f'_UV/f_UV - (alpha+1)/(k^2+m^2)] · 2k.
+        For "gaussian" UV: f'_UV/f_UV = -1/(2 Lambda^2).
+        For "hard" / "none": f_UV is constant on its support ⇒ first term = 0.
+        Inside-support only; callers must reject moves outside the hard cutoff.
+        """
+        k = np.asarray(x, dtype=float)
+        ksq = np.sum(k * k, axis=-1, keepdims=True)
+        if self.regulator == "gaussian":
+            uv_term = -1.0 / (2.0 * self.Lambda * self.Lambda)
+        else:
+            uv_term = 0.0
+        coef = uv_term - (self.alpha + 1.0) / (ksq + self.m * self.m)
+        return 2.0 * coef * k
 
 
 class Architecture(ABC):

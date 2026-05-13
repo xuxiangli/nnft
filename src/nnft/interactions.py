@@ -33,7 +33,7 @@ class LambdaPhi4:
         self.ir_regulator = ir_regulator
 
     # ----- public entry point --------------------------------------------
-    def action(self, theory, params, b, *, method="real_space_mc",
+    def action(self, theory, params, b, *, method="trans_sym",
                M_x=None, n_hermite=None, rng=None,
                x_quad=None, quad_weights=None, eps=1e-8, k_cut=None):
         """Return S_int per batch element, shape (b,).
@@ -44,11 +44,11 @@ class LambdaPhi4:
                     (b * N, *spec_shape) (the standard packed layout).
             b:      number of independent param configurations packed in params.
             method: one of "real_space_mc", "real_space_hermite",
-                    "explicit", "symmetry_reduced", "momentum_conservation".
+                    "explicit", "perm_sym", "trans_sym".
             M_x, n_hermite, rng: method-specific options (see _action_*).
             x_quad, quad_weights: optional cached quadrature for the real-space
                 methods. If x_quad is given, it overrides M_x / n_hermite.
-            eps, k_cut: method-specific options for "momentum_conservation".
+            eps, k_cut: method-specific options for "trans_sym".
                 If k_cut is None, use sqrt(2 log(1/eps)) / L.
         """
         if method == "real_space_mc":
@@ -81,13 +81,239 @@ class LambdaPhi4:
 
         if method == "explicit":
             return self._action_explicit(theory, params, b)
-        if method == "symmetry_reduced":
-            return self._action_symmetry_reduced(theory, params, b)
-        if method == "momentum_conservation":
-            return self._action_momentum_conservation(
+        if method == "perm_sym":
+            return self._action_perm_sym(theory, params, b)
+        if method == "trans_sym":
+            return self._action_trans_sym(
                 theory, params, b, eps=eps, k_cut=k_cut
             )
         raise ValueError(f"unknown method {method!r}")
+
+    # ----- action + gradient -------------------------------------------
+    def action_and_grad(self, theory, params, b, *, method="trans_sym",
+                        M_x=None, rng=None, x_quad=None,
+                        eps=1e-8, k_cut=None):
+        """Return (S, grad) where S has shape (b,) and grad is a dict
+            {"W0": (b*N, d), "b0": (b*N,), "W1": (b*N,)}.
+
+        Supported methods:
+          - "real_space_mc": gradient of the noisy MC quadrature; cheap (O(MN))
+            but inherits the ~10^-2 quadrature variance.
+          - "trans_sym": pair-pair sum with momentum-conservation truncation
+            |P_A + P_B| < k_cut; matches `action(method="trans_sym")` in
+            precision (machine-eps as eps -> 0). Cost ~O(N^2 * neighbors_per_pair).
+        """
+        if method == "real_space_mc":
+            if x_quad is not None:
+                xs = np.asarray(x_quad, dtype=float)
+            else:
+                if rng is None or M_x is None:
+                    raise ValueError("real_space_mc requires rng and M_x (or x_quad)")
+                xs = self.draw_mc_points(theory.architecture.d_in, int(M_x), rng)
+            return self._action_and_grad_real_space_mc(theory, params, b, xs)
+        if method == "trans_sym":
+            return self._action_and_grad_trans_sym(
+                theory, params, b, eps=eps, k_cut=k_cut
+            )
+        raise NotImplementedError(
+            f"action_and_grad does not support method={method!r}"
+        )
+
+    def _action_and_grad_real_space_mc(self, theory, params, b, xs):
+        arch = theory.architecture
+        d = arch.d_in
+        N = theory.N
+        M = xs.shape[0]
+        c_N = theory._c_N
+        A = self.lambda_ * (2.0 * np.pi) ** (d / 2.0) * self.L ** d / 24.0
+
+        has_alpha = hasattr(arch, "alpha")
+        m_sq = arch.m * arch.m if has_alpha else None
+        alpha = arch.alpha if has_alpha else 0.0
+
+        W0_all = np.asarray(params["W0"], dtype=float)   # (b*N, d)
+        b0_all = np.asarray(params["b0"], dtype=float)   # (b*N,)
+        W1_all = np.asarray(params["W1"], dtype=float)   # (b*N,)
+
+        S_out = np.empty(b, dtype=float)
+        grad_W0 = np.zeros_like(W0_all)
+        grad_b0 = np.zeros_like(b0_all)
+        grad_W1 = np.zeros_like(W1_all)   # left zero (W1 fixed by Constant)
+
+        coef = 4.0 * A * c_N / M
+
+        for bi in range(b):
+            sl = slice(bi * N, (bi + 1) * N)
+            k = W0_all[sl]                            # (N, d)
+            b0 = b0_all[sl]                           # (N,)
+            W1 = W1_all[sl]                           # (N,)
+            ksq = np.sum(k * k, axis=-1)
+            if has_alpha:
+                scale = (ksq + m_sq) ** (alpha / 2.0)
+                w = W1 * scale
+            else:
+                w = W1
+
+            pre = k @ xs.T + b0[:, None]               # (N, M)
+            cos_pre = np.cos(pre)
+            sin_pre = np.sin(pre)
+            Phi = c_N * (w[:, None] * cos_pre).sum(axis=0)   # (M,)
+            Phi3 = Phi ** 3                                  # (M,)
+
+            S_out[bi] = (A / M) * np.sum(Phi * Phi3)
+
+            # ∂S/∂b_i = -coef · w_i · Σ_r Phi3_r sin(pre_{ir})
+            grad_b0[sl] = -coef * w * (sin_pre @ Phi3)
+
+            # ∂S/∂k_{i,a}: term2 (always present)
+            #   = -coef · w_i · Σ_r Phi3_r sin(pre) x_{r,a}
+            sin_phi3 = sin_pre * Phi3[None, :]               # (N, M)
+            gk = -coef * w[:, None] * (sin_phi3 @ xs)        # (N, d)
+
+            # term1 (only when alpha != 0): coef · ∂w_i/∂k_{i,a} · Σ_r Phi3_r cos(pre)
+            if has_alpha and alpha != 0.0:
+                cos_dot_phi3 = cos_pre @ Phi3                # (N,)
+                dw_dk = (
+                    alpha * W1[:, None] * k
+                    * ((ksq + m_sq) ** (alpha / 2.0 - 1.0))[:, None]
+                )                                            # (N, d)
+                gk = gk + coef * dw_dk * cos_dot_phi3[:, None]
+
+            grad_W0[sl] = gk
+
+        return S_out, {"W0": grad_W0, "b0": grad_b0, "W1": grad_W1}
+
+    def _action_and_grad_trans_sym(self, theory, params, b, *, eps, k_cut):
+        """Pair-pair sum gradient with the same momentum-conservation
+        truncation as `_action_trans_sym`. See class docstring of
+        ``action_and_grad`` and the inline derivation in
+        ``_action_and_grad_trans_sym_one``.
+        """
+        d = theory.architecture.d_in
+        N = theory.N
+        if k_cut is None:
+            eps_f = float(eps)
+            if not 0.0 < eps_f < 1.0:
+                raise ValueError("eps must satisfy 0 < eps < 1")
+            k_cut = np.sqrt(2.0 * np.log(1.0 / eps_f)) / self.L
+        k_cut = float(k_cut)
+        if k_cut < 0.0:
+            raise ValueError("k_cut must be non-negative")
+
+        gamma = 0.5 * self.L * self.L
+        pref = (
+            self.lambda_ * (2.0 * np.pi) ** (d / 2.0) * self.L ** d
+            * theory._c_N ** 4 / 24.0
+        )
+
+        W0_all = np.asarray(params["W0"], dtype=float)
+        S_out = np.empty(b, dtype=float)
+        grad_W0 = np.zeros_like(W0_all)
+        grad_b0 = np.zeros(W0_all.shape[0], dtype=float)
+        grad_W1 = np.zeros(W0_all.shape[0], dtype=float)
+
+        for bi in range(b):
+            sl = slice(bi * N, (bi + 1) * N)
+            S_, gW0, gb0 = self._action_and_grad_trans_sym_one(
+                d, N, params, sl, theory, k_cut, gamma, pref,
+            )
+            S_out[bi] = S_
+            grad_W0[sl] = gW0
+            grad_b0[sl] = gb0
+        return S_out, {"W0": grad_W0, "b0": grad_b0, "W1": grad_W1}
+
+    def _action_and_grad_trans_sym_one(
+        self, d, N, params, sl, theory, k_cut, gamma, pref,
+    ):
+        """Single-config action and gradient via pair-pair sums.
+
+        Pair index layout (4*N^2 entries) matches
+        ``_signed_pair_momenta_and_coeffs(representative=False)``:
+            A_idx = block * N^2 + i * N + j, with
+            block in [0..3] for sign_pairs ((+,+),(+,-),(-,+),(-,-)).
+
+        Define F_A = Σ_B Q_B K(P_A + P_B), H_A = ∂F/∂P_A. Then with
+        ζ_n = α k_n / (|k_n|^2 + m^2) (zero for α=0):
+            ∂S̃/∂b_n = 4i Σ_{A: slot1=n} σ_A · Q_A · F_A
+            ∂S̃/∂k_n = 4 ζ_n · Σ_{A: slot1=n} Q_A F_A
+                     + 4 · Σ_{A: slot1=n} σ_A · Q_A · H_A
+        Real parts give the gradient of the (real) S̃; multiply by `pref`.
+        """
+        arch = theory.architecture
+        has_alpha = hasattr(arch, "alpha")
+        alpha = arch.alpha if has_alpha else 0.0
+        m_sq = arch.m * arch.m if has_alpha else 0.0
+
+        pair_momenta, pair_coeffs = self._signed_pair_momenta_and_coeffs(
+            params, sl, theory, representative=False
+        )
+        n_pairs = pair_momenta.shape[0]
+        assert n_pairs == 4 * N * N
+
+        # Neighbor list of pairs (A, B) with |P_A + P_B| < k_cut.
+        # cKDTree.sparse_distance_matrix(self, neg_self) returns indices
+        # (row=a in pair_momenta, col=b in -pair_momenta) at distance
+        # |P_A - (-P_B)| = |P_A + P_B| < k_cut.
+        if np.isinf(k_cut):
+            # dense fallback (small N only)
+            P_sum_full = (
+                pair_momenta[:, None, :] + pair_momenta[None, :, :]
+            )
+            Ksq = np.sum(P_sum_full * P_sum_full, axis=-1)
+            Kvals = np.exp(-gamma * Ksq)
+            action_complex = np.einsum(
+                "a,b,ab->", pair_coeffs, pair_coeffs, Kvals
+            )
+            F = Kvals @ pair_coeffs
+            H = -2.0 * gamma * np.einsum(
+                "ab,b,abd->ad", Kvals, pair_coeffs, P_sum_full
+            )
+        else:
+            tree = cKDTree(pair_momenta)
+            neg_tree = cKDTree(-pair_momenta)
+            coo = tree.sparse_distance_matrix(
+                neg_tree, k_cut, output_type="coo_matrix"
+            )
+            rows = coo.row
+            cols = coo.col
+            weights = np.exp(-gamma * coo.data * coo.data)   # K_{AB}
+            Q_b = pair_coeffs[cols] * weights                # (n_neigh,)
+            action_complex = np.sum(pair_coeffs[rows] * Q_b)
+            F = np.zeros(n_pairs, dtype=np.complex128)
+            np.add.at(F, rows, Q_b)
+            P_sum = pair_momenta[rows] + pair_momenta[cols]   # (n_neigh, d)
+            contrib_H = (-2.0 * gamma) * (Q_b[:, None] * P_sum)
+            H = np.zeros((n_pairs, d), dtype=np.complex128)
+            np.add.at(H, rows, contrib_H)
+
+        S_val = float(pref * np.real(action_complex))
+
+        # Reshape per (block, i, j) and sum over j (slot 2).
+        Q_blk = pair_coeffs.reshape(4, N, N)
+        F_blk = F.reshape(4, N, N)
+        H_blk = H.reshape(4, N, N, d)
+        sigmas = np.array([+1.0, +1.0, -1.0, -1.0])   # σ_i for each block
+
+        QF = (Q_blk * F_blk).sum(axis=2)              # (4, N) = Σ_j Q[i,j] F[i,j]
+        QH = (Q_blk[..., None] * H_blk).sum(axis=2)   # (4, N, d)
+
+        grad_b_complex = 4.0j * np.einsum("c,cn->n", sigmas, QF)
+        gk_F_part_complex = QF.sum(axis=0)            # Σ over blocks (no σ)
+        gk_H_part_complex = np.einsum("c,cnd->nd", sigmas, QH)
+
+        grad_b_real = pref * np.real(grad_b_complex)
+        if has_alpha and alpha != 0.0:
+            k = np.asarray(params["W0"][sl], dtype=float)
+            ksq = np.sum(k * k, axis=-1)
+            zeta = alpha * k / (ksq + m_sq)[:, None]      # (N, d)
+            grad_k = 4.0 * (
+                zeta * np.real(gk_F_part_complex)[:, None]
+                + np.real(gk_H_part_complex)
+            )
+        else:
+            grad_k = 4.0 * np.real(gk_H_part_complex)
+        grad_k_real = pref * grad_k
+        return S_val, grad_k_real, grad_b_real
 
     # ----- quadrature helpers --------------------------------------------
     def draw_mc_points(self, d, M_x, rng):
@@ -196,7 +422,7 @@ class LambdaPhi4:
         )
         return prefactor * total
 
-    def _action_symmetry_reduced(self, theory, params, b):
+    def _action_perm_sym(self, theory, params, b):
         """Same as _action_explicit but only sums over i<=j<=k<=l with the
         appropriate multinomial multiplicity. Reduces work by ~4!.
         """
@@ -205,7 +431,7 @@ class LambdaPhi4:
         return self._action_explicit(theory, params, b)
 
     # ----- approximate momentum-conservation summation -------------------
-    def _action_momentum_conservation(self, theory, params, b, *, eps, k_cut):
+    def _action_trans_sym(self, theory, params, b, *, eps, k_cut):
         """Sparse signed-pair sum using approximate momentum conservation.
 
         The Gaussian IR factor suppresses modes with total momentum
