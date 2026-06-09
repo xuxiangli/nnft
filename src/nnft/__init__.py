@@ -30,6 +30,12 @@ from .architectures import (
     UniSphere,
     Uniform,
 )
+from .diagnostics import (
+    autocorr_function,
+    autocorr_summary,
+    effective_sample_size,
+    integrated_autocorr,
+)
 from .interactions import LambdaPhi4, LambdaPhi4Box
 from .samplers import (
     HMCSampler,
@@ -67,7 +73,11 @@ __all__ = [
     "UniBall",
     "UniSphere",
     "Uniform",
+    "autocorr_function",
+    "autocorr_summary",
+    "effective_sample_size",
     "f_Lambda",
+    "integrated_autocorr",
     "omega_alpha",
     "omega_alpha_box",
     "propagator",
