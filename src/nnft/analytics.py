@@ -79,6 +79,109 @@ def _radial_kmax(Lambda, regulator):
     raise ValueError(f"regulator must be one of {_REGULATORS}, got {regulator!r}")
 
 
+_MAX_LATTICE_MODES = 5_000_000
+
+
+def _lattice_modes(d, L, Lambda, regulator):
+    """Enumerate finite-box momentum modes k = 2 pi n / L with |k| <= k_max.
+
+    Returns ``(n_int, k, ksq)`` where ``n_int`` is the (M, d) array of integer
+    mode vectors, ``k = 2 pi n / L`` the (M, d) momenta, and ``ksq`` their
+    squared norms (M,). The cutoff ``k_max`` follows the same convention as the
+    continuum radial sampler: ``hard -> Lambda``, ``gaussian -> Lambda
+    sqrt(2 ln(1/eps))``. A periodic box requires a UV regulator, so
+    ``regulator='none'`` is rejected by ``_radial_kmax``.
+    """
+    d = int(d)
+    L = float(L)
+    Lambda = float(Lambda)
+    k_max = _radial_kmax(Lambda, regulator)
+    dk = 2.0 * np.pi / L
+    n_max = int(np.ceil(k_max / dk))
+    n_box = (2 * n_max + 1) ** d
+    if n_box > _MAX_LATTICE_MODES:
+        raise ValueError(
+            f"lattice would enumerate {n_box} modes (n_max={n_max}, d={d}); "
+            f"exceeds cap {_MAX_LATTICE_MODES}. Lower Lambda or L, or raise "
+            f"_MAX_LATTICE_MODES."
+        )
+    axis = np.arange(-n_max, n_max + 1)
+    grids = np.meshgrid(*([axis] * d), indexing="ij")
+    n_int = np.stack([g.reshape(-1) for g in grids], axis=-1)
+    k = dk * n_int
+    ksq = np.sum(k * k, axis=-1)
+    inside = ksq <= k_max * k_max
+    return n_int[inside], k[inside], ksq[inside]
+
+
+def omega_alpha_box(d, m, alpha, L, Lambda, regulator):
+    """Finite-box Omega_alpha = (1/V) sum_n f_Lambda(k^2)/(k^2+m^2)^(alpha+1).
+
+    Discrete (mode-sum) analogue of :func:`omega_alpha`, with V = L^d and the
+    sum over lattice modes k = 2 pi n / L inside the UV cutoff.
+    """
+    m = float(m)
+    alpha = float(alpha)
+    L = float(L)
+    d = int(d)
+    _, _, ksq = _lattice_modes(d, L, Lambda, regulator)
+    w = f_Lambda(ksq, Lambda, regulator) / (ksq + m * m) ** (alpha + 1.0)
+    return float(np.sum(w) / L ** d)
+
+
+def propagator_box(r, d, m, L, Lambda, regulator):
+    """Free finite-box 2-pt at separation Δx = (r, 0, ..., 0),
+
+        G2(Δx) = (1/V) sum_n f_Lambda(k^2)/(k^2+m^2) cos(k·Δx) ,
+
+    with V = L^d and k = 2 pi n / L. This is the discrete-momentum analogue of
+    :func:`propagator`; it converges to it as L -> infinity (Riemann sum). The
+    alpha-dependence of the architecture cancels, so no alpha argument is needed.
+    """
+    r = float(r)
+    m = float(m)
+    L = float(L)
+    d = int(d)
+    _, k, ksq = _lattice_modes(d, L, Lambda, regulator)
+    dx = np.zeros(d)
+    dx[0] = r
+    phase = k @ dx
+    w = f_Lambda(ksq, Lambda, regulator) / (ksq + m * m)
+    return float(np.sum(w * np.cos(phase)) / L ** d)
+
+
+def G2_lambda_phi4_one_loop_box(r, d, m, lambda_, L, Lambda, regulator):
+    """Finite-box tree + one-loop tadpole 2-pt at separation Δx = (r, 0, ..., 0):
+
+        G2(r) = Δ_box(r) - (λ/2) Δ_box(0) I2_box(r),
+
+    with all pieces evaluated as mode sums over k = 2 pi n / L (V = L^d):
+
+        Δ_box(r)  = (1/V) Σ_n f(k^2) / (k^2 + m^2)        cos(k·Δx)   [= propagator_box]
+        Δ_box(0)  = (1/V) Σ_n f(k^2) / (k^2 + m^2)                    [tadpole loop]
+        I2_box(r) = (1/V) Σ_n f(k^2)^2 / (k^2 + m^2)^2    cos(k·Δx)
+
+    The loop propagator carries f^2 (each of the two internal propagators carries
+    one UV factor f), matching the continuum convention where the loop sees
+    Λ -> Λ/√2 for a Gaussian regulator.
+    """
+    r = float(r)
+    m = float(m)
+    L = float(L)
+    d = int(d)
+    _, k, ksq = _lattice_modes(d, L, Lambda, regulator)
+    V = L ** d
+    dx = np.zeros(d)
+    dx[0] = r
+    cos = np.cos(k @ dx)
+    f = f_Lambda(ksq, Lambda, regulator)
+    denom = ksq + m * m
+    tree = np.sum(f / denom * cos) / V
+    Delta0 = np.sum(f / denom) / V
+    I2 = np.sum(f * f / (denom * denom) * cos) / V
+    return float(tree - 0.5 * lambda_ * Delta0 * I2)
+
+
 def _upper_gamma(s, x):
     """Upper incomplete gamma Γ(s, x) = ∫_x^∞ t^{s-1} e^{-t} dt for x > 0.
 

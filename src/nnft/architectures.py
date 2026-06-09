@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
-from .analytics import f_Lambda, omega_alpha
+from .analytics import _lattice_modes, f_Lambda, omega_alpha, omega_alpha_box
 
 
 class Distribution:
@@ -224,6 +224,85 @@ class RegulatedMomentum(Distribution):
         return 2.0 * coef * k
 
 
+class LatticeMomentum(Distribution):
+    """Discrete momentum prior for the finite periodic box.
+
+    k lives on the lattice k = 2 pi n / L (n in Z^d) inside the UV cutoff, with
+    categorical mass
+
+        P_G(n) propto f_Lambda(k^2) / (k^2 + m^2)^(alpha + 1) .
+
+    The marginal normalization matches the box CosNetFT: Omega_alpha^L =
+    (1/V) sum_n f_Lambda(k^2)/(k^2+m^2)^(alpha+1), V = L^d (see
+    :func:`omega_alpha_box`).
+    """
+
+    _ROUND_TOL = 1e-6
+
+    def __init__(self, d, m, alpha, L, Lambda, regulator="hard"):
+        self.d = int(d)
+        self.m = float(m)
+        self.alpha = float(alpha)
+        self.L = float(L)
+        self.Lambda = float(Lambda)
+        self.regulator = regulator
+        self._dk = 2.0 * np.pi / self.L
+
+        n_int, k, ksq = _lattice_modes(self.d, self.L, self.Lambda, regulator)
+        self._n_int = n_int                       # (M, d) integer modes
+        self._modes = k                           # (M, d) momenta
+        w = f_Lambda(ksq, self.Lambda, regulator) / (ksq + self.m * self.m) ** (
+            self.alpha + 1.0
+        )
+        self._w = w
+        self._log_Z = float(np.log(np.sum(w)))
+        self._p = w / np.sum(w)
+        # integer-tuple -> log weight, for O(1) membership / mass lookup
+        self._logw_by_key = {
+            tuple(int(c) for c in n_int[i]): float(np.log(w[i]))
+            for i in range(n_int.shape[0])
+        }
+
+    def sample(self, size, rng):
+        n = size[0]
+        idx = rng.choice(self._modes.shape[0], size=n, p=self._p)
+        return self._modes[idx]
+
+    def log_pdf(self, x):
+        """Categorical log-mass log w_n - log Z at lattice point k; -inf off the
+        lattice or outside the UV cutoff."""
+        k = np.atleast_2d(np.asarray(x, dtype=float))
+        n_round = np.rint(k / self._dk)
+        k_back = n_round * self._dk
+        on_lattice = np.all(np.abs(k - k_back) <= self._ROUND_TOL * self._dk, axis=-1)
+        out = np.full(k.shape[0], -np.inf)
+        for i in range(k.shape[0]):
+            if not on_lattice[i]:
+                continue
+            key = tuple(int(c) for c in n_round[i])
+            logw = self._logw_by_key.get(key)
+            if logw is not None:
+                out[i] = logw - self._log_Z
+        return out if np.ndim(x) > 1 else out[0]
+
+    def propose(self, current, rng, scale):
+        """Symmetric integer hop: add +/-1 (random sign) to a random nonempty
+        subset of axes, i.e. k -> k +/- (2 pi / L) e_axis. ``scale`` sets how
+        many axes hop per neuron (>= 1, capped at d). Handles both a single
+        neuron (shape (d,)) and a full batch (shape (N, d)), with an
+        independent hop per neuron in the batched case."""
+        k = np.asarray(current, dtype=float).copy()
+        n_axes = min(max(1, int(round(float(scale)))), self.d)
+        if k.ndim == 1:
+            axes = rng.choice(self.d, size=n_axes, replace=False)
+            k[axes] += self._dk * rng.choice([-1.0, 1.0], size=n_axes)
+            return k
+        for r in range(k.shape[0]):
+            axes = rng.choice(self.d, size=n_axes, replace=False)
+            k[r, axes] += self._dk * rng.choice([-1.0, 1.0], size=n_axes)
+        return k
+
+
 class Architecture(ABC):
     """Single-neuron architecture: defines varphi(x; theta_j)."""
 
@@ -344,6 +423,48 @@ class CosNetFT(Architecture):
         return {
             "W0": RegulatedMomentum(
                 self.d_in, self.m, self.alpha, self.Lambda, self.regulator
+            ),
+            "b0": Uniform(-np.pi, np.pi),
+            "W1": Constant(np.sqrt(2.0 * self.Omega)),
+        }
+
+
+class CosNetFTBox(CosNetFT):
+    """Finite-box CosNetFT: same field varphi_j(x) = W1_j cos(W0_j . x + b0_j)
+    with W1_j *= (|W0_j|^2 + m^2)^(alpha/2), but momenta live on the lattice
+    W0 = 2 pi n / L (periodic box of side L) and the normalization is the
+    mode-sum Omega_alpha^L (see :func:`omega_alpha_box`).
+
+    The field formula and param_spec are inherited from CosNetFT unchanged
+    (x stays continuous); only the parameter distributions and Omega differ.
+    """
+
+    def __init__(self, d_in, m, alpha, L, Lambda, regulator="hard"):
+        """
+        Args:
+            d_in:      input dimension.
+            m:         mass parameter.
+            alpha:     power-law exponent in the W1 scaling and W0 PDF.
+            L:         box side length (periodic), sets the momentum spacing
+                       2 pi / L.
+            Lambda:    UV cutoff scale.
+            regulator: "hard" or "gaussian" UV regulator on the mode sum.
+        """
+        self.d_in = int(d_in)
+        self.m = float(m)
+        self.alpha = float(alpha)
+        self.L = float(L)
+        self.Lambda = float(Lambda)
+        self.regulator = regulator
+        self.Omega = omega_alpha_box(
+            self.d_in, self.m, self.alpha, self.L, self.Lambda, regulator
+        )
+
+    def default_dists(self):
+        """Canonical finite-box parameter distributions."""
+        return {
+            "W0": LatticeMomentum(
+                self.d_in, self.m, self.alpha, self.L, self.Lambda, self.regulator
             ),
             "b0": Uniform(-np.pi, np.pi),
             "W1": Constant(np.sqrt(2.0 * self.Omega)),

@@ -39,7 +39,7 @@ class MetropolisHastingsSampler(Sampler):
         P(theta) propto P_G(theta) exp(-S_int(theta))
     over the per-neuron parameters.
 
-    Two proposal modes are provided:
+    Three proposal modes are provided:
         proposal_mode="all":    one MH step proposes a fresh full configuration
                                 of N neurons; cost per step O(action eval).
         proposal_mode="single": one neuron is updated per inner step; one outer
@@ -47,6 +47,13 @@ class MetropolisHastingsSampler(Sampler):
                                 interaction is a LambdaPhi4 with a real-space
                                 quadrature method, a per-quadrature-point cache
                                 makes each inner step O(M_x) instead of O(M_x N).
+        proposal_mode="single_redraw": one neuron per inner step is redrawn
+                                wholesale from the prior (independence proposal).
+                                The prior cancels in the MH ratio, leaving
+                                acceptance min(1, exp(-Delta S_int)). This is the
+                                recommended mode for discrete-momentum priors
+                                (finite box / LatticeMomentum), where local
+                                proposals mix poorly; `proposals` is ignored.
 
     The chain state is held internally; successive calls to `sample` continue
     from where the previous call ended.
@@ -65,7 +72,7 @@ class MetropolisHastingsSampler(Sampler):
         action_kwargs=None,
         resample_x_per_sweep=False,
     ):
-        if proposal_mode not in ("all", "single"):
+        if proposal_mode not in ("all", "single", "single_redraw"):
             raise ValueError(f"unknown proposal_mode {proposal_mode!r}")
         self.interaction = interaction
         self.proposals = dict(proposals)
@@ -196,14 +203,15 @@ class MetropolisHastingsSampler(Sampler):
     def _compute_log_prior(self, state):
         total = 0.0
         for name, dist in self._theory.param_dists.items():
+            # Skip Constant (W1): its value is pinned, so log_pdf is 0 at the
+            # state and -inf elsewhere; including it would spuriously zero a
+            # meaningful -inf from other priors. Other priors' -inf (e.g. a
+            # LatticeMomentum hop outside the UV cutoff, or a hard-cutoff
+            # RegulatedMomentum) must propagate so _step_all rejects the move.
+            if isinstance(dist, Constant):
+                continue
             if hasattr(dist, "log_pdf"):
-                lp = dist.log_pdf(state[name])
-                # Constant returns -inf at every point that disagrees; in our
-                # use case Constant draws exactly one value so log_pdf=0 there.
-                lp = np.where(np.isneginf(lp), 0.0, lp) if isinstance(
-                    lp, np.ndarray
-                ) else lp
-                total += float(np.sum(lp))
+                total += float(np.sum(dist.log_pdf(state[name])))
         return total
 
     def _maybe_resample_x_quad(self, rng):
@@ -226,6 +234,8 @@ class MetropolisHastingsSampler(Sampler):
         self._maybe_resample_x_quad(rng)
         if self.proposal_mode == "all":
             self._step_all(rng)
+        elif self.proposal_mode == "single_redraw":
+            self._step_single_redraw_sweep(rng)
         else:
             self._step_single_sweep(rng)
 
@@ -240,6 +250,11 @@ class MetropolisHastingsSampler(Sampler):
             # wrap to [-pi, pi]
             new = ((new + np.pi) % (2.0 * np.pi)) - np.pi
             return new, True
+        if kind == "lattice":
+            # Discrete lattice hop (finite box). Delegates to the parameter's
+            # distribution, which knows the lattice spacing 2 pi / L. Symmetric.
+            dist = self._theory.param_dists[name]
+            return dist.propose(current, rng, scale), True
         raise ValueError(f"unknown proposal kind {kind!r}")
 
     def _step_all(self, rng):
@@ -291,6 +306,48 @@ class MetropolisHastingsSampler(Sampler):
             )
         raise AssertionError("unreachable")
 
+    def _step_single_redraw_sweep(self, rng):
+        """One sweep of N single-neuron independence (prior-redraw) updates.
+
+        For each neuron, draw (k, b) afresh from the prior. For a full prior
+        redraw the prior densities cancel against the proposal densities in the
+        MH ratio, so the acceptance is simply min(1, exp(-Delta S_int)). This
+        mixes globally in the discrete momentum, unlike local lattice hops.
+        Constant (W1) parameters are pinned and left unchanged.
+        """
+        N = self._theory.N
+        order = rng.permutation(N)
+        for i in order:
+            self._step_single_redraw(int(i), rng)
+
+    def _step_single_redraw(self, i, rng):
+        spec = self._theory.architecture.param_spec
+        new_neuron = {}
+        for name, dist in self._theory.param_dists.items():
+            if isinstance(dist, Constant):
+                new_neuron[name] = self._state[name][i]
+                continue
+            new_neuron[name] = dist.sample((1,) + spec[name], rng)[0]
+
+        trial = {k: v.copy() for k, v in self._state.items()}
+        for name, val in new_neuron.items():
+            trial[name][i] = val
+        new_S = float(
+            self.interaction.action(
+                self._theory, trial, b=1,
+                method=self.action_method,
+                **self.action_kwargs,
+            )[0]
+        )
+        # prior cancels for a full prior-redraw independence proposal
+        log_alpha = -(new_S - self._S_int)
+        self._n_propose += 1
+        if np.log(rng.uniform()) < log_alpha:
+            for name, val in new_neuron.items():
+                self._state[name][i] = val
+            self._S_int = new_S
+            self._n_accept += 1
+
     def _step_single_sweep(self, rng):
         """One sweep = N single-neuron MH proposals (random order)."""
         N = self._theory.N
@@ -310,13 +367,15 @@ class MetropolisHastingsSampler(Sampler):
         log_prior_old = 0.0
         log_prior_new = 0.0
         for name, dist in self._theory.param_dists.items():
+            # Skip Constant (W1): pinned value, log_pdf == 0 at the state. Other
+            # priors' -inf must propagate so the move is rejected below.
+            if isinstance(dist, Constant):
+                continue
             if hasattr(dist, "log_pdf"):
                 lp_old = dist.log_pdf(self._state[name][i])
                 lp_new = dist.log_pdf(new_neuron[name])
                 lp_old = np.sum(lp_old) if np.ndim(lp_old) > 0 else float(lp_old)
                 lp_new = np.sum(lp_new) if np.ndim(lp_new) > 0 else float(lp_new)
-                if np.isneginf(lp_old):
-                    lp_old = 0.0
                 log_prior_old += float(lp_old)
                 log_prior_new += float(lp_new)
         if not np.isfinite(log_prior_new):

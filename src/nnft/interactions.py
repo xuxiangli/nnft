@@ -559,3 +559,151 @@ class LambdaPhi4:
                 pair_coeffs * np.exp(-gamma * Ksq)
             )
         return total
+
+
+class LambdaPhi4Box:
+    """S_int[phi] = (lambda/4!) int_{box} d^d x phi(x)^4 in a periodic box.
+
+    The finite box of side L (momenta k = 2 pi n / L, n in Z^d) is the IR
+    regulator, so there is no f_IR factor and momentum conservation is exact:
+
+        S_int = (lambda L^d / 4!) c_N^4 sum_{i,j,k,l} sum_{(±)^4}
+                a_i^± a_j^± a_k^± a_l^± delta_{±n_i ±n_j ±n_k ±n_l, 0} ,
+
+    with a_i^± = (1/2) w1_i e^{± i b_i}. Stateless evaluator with the same
+    ``action(theory, params, b, *, method=...)`` surface as :class:`LambdaPhi4`,
+    so it drops into ``correlator_reweighted`` and the Metropolis-Hastings
+    ``_x_quad is None`` path unchanged.
+    """
+
+    def __init__(self, lambda_, L):
+        self.lambda_ = float(lambda_)
+        self.L = float(L)
+
+    # ----- public entry point --------------------------------------------
+    def action(self, theory, params, b, *, method="exact", **_ignored):
+        """Return S_int per batch element, shape (b,).
+
+        method:
+            "exact"    -- O(N^2) signed-pair hash join on exact integer
+                          momentum conservation (default).
+            "explicit" -- exact O(8 N^4) momentum sum; ground truth for tiny N.
+        """
+        d = theory.architecture.d_in
+        N = theory.N
+        out = np.empty(b, dtype=float)
+        for bi in range(b):
+            sl = slice(bi * N, (bi + 1) * N)
+            if method == "exact":
+                out[bi] = self._exact_one(d, N, params, sl, theory)
+            elif method == "explicit":
+                out[bi] = self._explicit_one(d, N, params, sl, theory)
+            else:
+                raise ValueError(f"unknown method {method!r}")
+        return out
+
+    # ----- helpers --------------------------------------------------------
+    def _amplitudes(self, params, sl, theory):
+        """Return (n_int (N,d), b0 (N,), w1 (N,)) for one configuration.
+
+        n_int = round(k L / 2 pi) are the integer mode labels; w1 includes the
+        CosNetFT (|k|^2 + m^2)^(alpha/2) factor when the architecture carries
+        an alpha attribute.
+        """
+        arch = theory.architecture
+        k = np.asarray(params["W0"][sl], dtype=float)
+        b0 = np.asarray(params["b0"][sl], dtype=float)
+        if hasattr(arch, "alpha"):
+            W1 = np.asarray(params["W1"][sl], dtype=float)
+            w1 = W1 * (np.sum(k * k, axis=-1) + arch.m * arch.m) ** (
+                arch.alpha / 2.0
+            )
+        else:
+            w1 = np.asarray(params["W1"][sl], dtype=float)
+        n_int = np.rint(k * self.L / (2.0 * np.pi)).astype(np.int64)
+        return n_int, b0, w1
+
+    def _exact_one(self, d, N, params, sl, theory):
+        """Signed-pair sum with exact integer momentum conservation, computed by
+        a vectorized hash join: encode each integer pair momentum as a single
+        int64 key, group coefficients by key (sort), then for each pair A add
+        C_A * (sum of C_B over pairs B with key_B = -key_A) via searchsorted.
+        O(N^2 log N), no Python-level per-pair loop.
+        """
+        n_int, b0, w1 = self._amplitudes(params, sl, theory)
+        u = {1: 0.5 * w1 * np.exp(1j * b0), -1: 0.5 * w1 * np.exp(-1j * b0)}
+
+        sign_pairs = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+        m_blocks = []
+        C_blocks = []
+        for sigma, tau in sign_pairs:
+            m = (sigma * n_int[:, None, :] + tau * n_int[None, :, :]).reshape(
+                N * N, d
+            )
+            C = (u[sigma][:, None] * u[tau][None, :]).reshape(N * N)
+            m_blocks.append(m)
+            C_blocks.append(C)
+        m_all = np.concatenate(m_blocks, axis=0).astype(np.int64)   # (4N^2, d)
+        C_all = np.concatenate(C_blocks, axis=0)                    # (4N^2,)
+
+        # Encode integer vectors as a single int64 key. Components lie in
+        # [-R, R] with R = max|component|; use base = 2R+1, offset = R so the
+        # encoding is identical for m and -m.
+        R = int(np.abs(m_all).max()) if m_all.size else 0
+        base = np.int64(2 * R + 1)
+        off = np.int64(R)
+        powers = base ** np.arange(d, dtype=np.int64)
+        keys = ((m_all + off) @ powers).astype(np.int64)           # (4N^2,)
+        neg_keys = ((-m_all + off) @ powers).astype(np.int64)
+
+        # Group-sum C by key: sort, segment-sum at unique keys.
+        order = np.argsort(keys, kind="stable")
+        sk = keys[order]
+        sC = C_all[order]
+        uniq, start = np.unique(sk, return_index=True)
+        grp = np.add.reduceat(sC, start)                           # sum C per key
+
+        # For each pair A, fetch sum over pairs with key = -key_A.
+        pos = np.searchsorted(uniq, neg_keys)
+        pos_clipped = np.clip(pos, 0, len(uniq) - 1)
+        hit = uniq[pos_clipped] == neg_keys
+        partner = np.where(hit, grp[pos_clipped], 0.0 + 0.0j)
+        total = np.sum(C_all * partner)
+
+        prefactor = self.lambda_ * self.L ** d * theory._c_N ** 4 / 24.0
+        return float(prefactor * total.real)
+
+    def _explicit_one(self, d, N, params, sl, theory):
+        """Exact O(8 N^4) reduced momentum sum (sigma_i fixed to +1, doubled).
+
+        Mirrors LambdaPhi4._explicit_one but with an exact Kronecker delta on
+        the integer momenta and no (2 pi)^{d/2} factor. Only practical for tiny
+        N; used to validate ``_exact_one``.
+        """
+        n_int, b0, w1 = self._amplitudes(params, sl, theory)
+        ni = n_int[:, None, None, None, :]
+        nj = n_int[None, :, None, None, :]
+        nk = n_int[None, None, :, None, :]
+        nl = n_int[None, None, None, :, :]
+        bi = b0[:, None, None, None]
+        bj = b0[None, :, None, None]
+        bk = b0[None, None, :, None]
+        bl = b0[None, None, None, :]
+        ww = (
+            w1[:, None, None, None]
+            * w1[None, :, None, None]
+            * w1[None, None, :, None]
+            * w1[None, None, None, :]
+        )
+        total = 0.0
+        for s1 in (+1, -1):
+            for s2 in (+1, -1):
+                for s3 in (+1, -1):
+                    K = ni + s1 * nj + s2 * nk + s3 * nl
+                    delta = np.all(K == 0, axis=-1)
+                    phase = bi + s1 * bj + s2 * bk + s3 * bl
+                    total += np.sum(np.where(delta, np.cos(phase) * ww, 0.0))
+        # total = 8 * (full 4-fold signed sum); combined with the 1/16 from
+        # cos = (e + e)/2 in phi^4 this gives c_N^4 / 8 relative to _exact_one.
+        prefactor = self.lambda_ * self.L ** d * theory._c_N ** 4 / (24.0 * 8.0)
+        return float(prefactor * total)
