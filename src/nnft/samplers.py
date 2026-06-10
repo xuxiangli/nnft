@@ -255,6 +255,11 @@ class MetropolisHastingsSampler(Sampler):
             # distribution, which knows the lattice spacing 2 pi / L. Symmetric.
             dist = self._theory.param_dists[name]
             return dist.propose(current, rng, scale), True
+        if kind == "lattice_soft":
+            # Three-choice lattice hop (finite box): each axis moves by
+            # {+2 pi/L, 0, -2 pi/L} with P = {scale/2, 1-scale, scale/2}.
+            dist = self._theory.param_dists[name]
+            return dist.propose_soft(current, rng, scale), True
         raise ValueError(f"unknown proposal kind {kind!r}")
 
     def _step_all(self, rng):

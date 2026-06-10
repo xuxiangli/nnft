@@ -302,6 +302,21 @@ class LatticeMomentum(Distribution):
             k[r, axes] += self._dk * rng.choice([-1.0, 1.0], size=n_axes)
         return k
 
+    def propose_soft(self, current, rng, p):
+        """Symmetric three-choice hop: each axis of each neuron independently
+        moves by +2 pi/L, 0, or -2 pi/L with probabilities {p/2, 1-p, p/2}.
+
+        Unlike :meth:`propose`, neurons are allowed to stay put, so the
+        expected number of moving components scales with ``p`` and a
+        full-configuration ("all" mode) proposal can be made arbitrarily
+        gentle. Symmetric for any p in (0, 1]."""
+        k = np.asarray(current, dtype=float).copy()
+        p = min(max(float(p), 0.0), 1.0)
+        steps = rng.choice(
+            [-1.0, 0.0, 1.0], size=k.shape, p=[p / 2.0, 1.0 - p, p / 2.0]
+        )
+        return k + self._dk * steps
+
 
 class Architecture(ABC):
     """Single-neuron architecture: defines varphi(x; theta_j)."""
